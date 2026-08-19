@@ -1,0 +1,19 @@
+{
+  "name": "home-display",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Six-color e-paper dashboard gateway for the reTerminal E1002",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node server/dashboard.mjs",
+    "test": "node --test",
+    "audit:public": "sh scripts/audit-public.sh"
+  },
+  "dependencies": {
+    "sharp": "^0.33.5"
+  }
+}

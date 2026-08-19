@@ -1,0 +1,21 @@
+# Keep credentials and local state out of the build context entirely, so they
+# cannot end up in an image layer even by accident.
+.secrets/
+.state/
+include/secrets.h
+.env
+
+.git/
+.github/
+node_modules/
+.pio/
+.backups/
+.DS_Store
+
+# Firmware and simulator are not part of the runtime image.
+src/
+sim/
+test/
+platformio.ini
+*.md
+!README.md

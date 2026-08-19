@@ -1,0 +1,69 @@
+{
+  "protocolVersion": 5,
+  "generatedAt": "2026-08-18T21:58:00-04:00",
+  "timezone": "America/New_York",
+  "stale": false,
+  "display": {
+    "dateLabel": "TUESDAY, AUG 18",
+    "updatedLabel": "UPDATED 9:58PM"
+  },
+  "calendar": [
+    {
+      "title": "Dentist",
+      "location": "",
+      "startAt": "2026-08-19T09:00:00-04:00",
+      "endAt": "2026-08-19T09:45:00-04:00",
+      "allDay": false,
+      "dayLabel": "TOMORROW",
+      "timeLabel": "9:00AM",
+      "relativeLabel": "TOMORROW",
+      "urgent": false
+    }
+  ],
+  "timeline": [
+    {
+      "occurredAt": "2026-08-18T07:58:00-04:00",
+      "timeLabel": "7:58AM",
+      "sourceLabel": "MESSAGES",
+      "actor": "Robin",
+      "summary": "Confirmed the Thursday walkthrough"
+    },
+    {
+      "occurredAt": "2026-08-18T10:15:00-04:00",
+      "timeLabel": "10:15AM",
+      "sourceLabel": "SLACK",
+      "actor": "Priya",
+      "summary": "Pushed the panel driver patch for review"
+    },
+    {
+      "occurredAt": "2026-08-18T13:58:00-04:00",
+      "timeLabel": "1:58PM",
+      "sourceLabel": "SLACK",
+      "actor": "You",
+      "summary": "Reviewed the club leader applications"
+    },
+    {
+      "occurredAt": "2026-08-18T16:20:00-04:00",
+      "timeLabel": "4:20PM",
+      "sourceLabel": "MAIL",
+      "actor": "Marcus Webb",
+      "summary": "Quote for the enclosure run"
+    },
+    {
+      "occurredAt": "2026-08-18T18:04:00-04:00",
+      "timeLabel": "6:04PM",
+      "sourceLabel": "SLACK",
+      "actor": "jules",
+      "summary": "New masthead options are in Figma"
+    },
+    {
+      "occurredAt": "2026-08-18T21:29:00-04:00",
+      "timeLabel": "9:29PM",
+      "sourceLabel": "WHATSAPP",
+      "actor": "Marcus Webb",
+      "summary": "Still waiting on the supplier to confirm"
+    }
+  ],
+  "photo": null,
+  "freshness": {}
+}

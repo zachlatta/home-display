@@ -1,0 +1,11 @@
+.pio/
+.backups/
+sim/vendor/
+sim/build/
+sim/out/
+.DS_Store
+.secrets/
+.state/
+include/secrets.h
+server/*.log
+node_modules/
