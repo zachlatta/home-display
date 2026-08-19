@@ -11,6 +11,9 @@ const DEFAULT_TOKEN_PATH = resolve(ROOT, '.secrets/dashboard-token');
 const DEFAULT_CACHE_PATH = resolve(ROOT, '.state/dashboard-cache.json');
 const DEFAULT_PDW_CONFIG = resolve(process.env.HOME ?? '', '.config/pdw-cli/config.json');
 const CACHE_TTL_MS = 5 * 60 * 1000;
+// A client holding the bearer token can ask for ?refresh=1. Without a floor that
+// is an amplifier onto the warehouse, one upstream query per request.
+const MIN_FORCED_REFRESH_MS = 60 * 1000;
 const STALE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const TIMEZONE = 'America/New_York';
 const TIMELINE_LIMIT = 6;
@@ -19,6 +22,7 @@ const PHOTO_WIDTH = 270;
 const PHOTO_HEIGHT = 250;
 const PHOTO_BYTES = PHOTO_WIDTH * PHOTO_HEIGHT / 2;
 const MAX_SOURCE_PHOTO_BYTES = 5 * 1024 * 1024;
+const MAX_SQL_RESPONSE_BYTES = 32 * 1024 * 1024;
 
 function safeEqual(left, right) {
   const a = createHash('sha256').update(left).digest();
@@ -313,13 +317,31 @@ export function normalizeDashboard(raw, now = new Date()) {
     // Filled in by the loader once a candidate photo has been fetched and shown
     // to survive quantisation; metadata alone is not worth a slot on the panel.
     photo: photoDisplay(firstPhotoCandidate(parsed)),
-    freshness: parsed.freshness ?? {},
+    freshness: summariseFreshness(parsed.freshness),
   };
 }
 
+// The query says LIMIT 6, but the gateway must not depend on that: each
+// candidate costs an object-API call plus a download plus a native decode, so an
+// unexpected list length would be a fan-out amplifier.
+const MAX_PHOTO_CANDIDATES = 6;
+
+// The device only needs to know whether its sources are current, not what they
+// are called or when each one last synced.
+function summariseFreshness(freshness) {
+  if (!freshness || typeof freshness !== 'object') return {};
+  const ages = Object.values(freshness)
+    .map((entry) => Number(entry?.ageSeconds))
+    .filter((age) => Number.isFinite(age));
+  if (!ages.length) return {};
+  return { maxAgeSeconds: Math.max(...ages), sources: ages.length };
+}
+
 function photoCandidates(parsed) {
-  if (Array.isArray(parsed.photos)) return parsed.photos.filter(Boolean);
-  return parsed.photo ? [parsed.photo] : [];
+  const list = Array.isArray(parsed.photos)
+    ? parsed.photos.filter(Boolean)
+    : (parsed.photo ? [parsed.photo] : []);
+  return list.slice(0, MAX_PHOTO_CANDIDATES);
 }
 
 function firstPhotoCandidate(parsed) {
@@ -492,8 +514,26 @@ export function evaluateQuantizedPhoto(packed) {
 
 // Centre-crop to the panel aperture and reduce to the six inks. DESIGN.md calls
 // for a centre crop rather than a letterbox, so the photo fills the frame.
+// libvips auto-detects format, which would expose the TIFF/WebP/AVIF/SVG
+// decoders to whatever bytes arrive. The archive is JPEG, so require it.
+function assertJpeg(bytes) {
+  if (bytes.length < 3 || bytes[0] !== 0xff || bytes[1] !== 0xd8 || bytes[2] !== 0xff) {
+    throw new Error('Photo download is not a JPEG');
+  }
+}
+
 async function convertPhoto(sourceBytes) {
-  const { data, info } = await sharp(sourceBytes, { failOn: 'none' })
+  assertJpeg(sourceBytes);
+  const { data, info } = await sharp(sourceBytes, {
+    // Bail on malformed input instead of pushing it deeper through the decoder;
+    // an unusable candidate is skipped and the next one is tried.
+    failOn: 'error',
+    // sharp defaults to ~268 megapixels. A decompression bomb well under the
+    // 5 MB download cap could still exhaust the container at that limit; the
+    // panel aperture is 270x250, so 40 MP is already far more than useful.
+    limitInputPixels: 40_000_000,
+    sequentialRead: true,
+  })
     .rotate() // honour EXIF orientation before cropping
     .resize(PHOTO_WIDTH, PHOTO_HEIGHT, { fit: 'cover', position: 'centre' })
     .flatten({ background: '#ffffff' })
@@ -501,6 +541,51 @@ async function convertPhoto(sourceBytes) {
     .raw()
     .toBuffer({ resolveWithObject: true });
   return quantizeRgb(data, info.width, info.height);
+}
+
+// The object API hands back a signed download URL. It is PDW-supplied rather
+// than user-supplied, but the gateway holds a warehouse credential and sits on a
+// Docker network alongside other services, so a misbehaving or compromised PDW
+// must not be able to steer it at an internal address. Signed object URLs are
+// same-origin with the API itself, so require exactly that.
+function assertSafeDownloadUrl(rawUrl, baseUrl) {
+  let url;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    throw new Error('PDW object API returned an unparseable download URL');
+  }
+  if (url.protocol !== 'https:') {
+    throw new Error(`Refusing non-HTTPS photo download (${url.protocol})`);
+  }
+  const expected = new URL(baseUrl).hostname;
+  if (url.hostname !== expected) {
+    throw new Error('Refusing photo download from an unexpected host');
+  }
+  return url;
+}
+
+async function readBounded(response, maxBytes) {
+  if (!response.body?.getReader) {
+    const buffer = Buffer.from(await response.arrayBuffer());
+    if (buffer.length > maxBytes) throw new Error('Response exceeded the size limit');
+    return buffer;
+  }
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.length;
+      if (total > maxBytes) throw new Error('Response exceeded the size limit');
+      chunks.push(Buffer.from(value));
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+  return Buffer.concat(chunks, total);
 }
 
 async function loadPhoto(reference, { baseUrl, token, fetchImpl }) {
@@ -523,16 +608,20 @@ async function loadPhoto(reference, { baseUrl, token, fetchImpl }) {
   const downloadUrl = objectBody?.data?.download_url;
   if (!downloadUrl) throw new Error('PDW object API returned no download URL');
 
-  const imageResponse = await fetchImpl(downloadUrl, { signal: AbortSignal.timeout(15_000) });
+  const safeUrl = assertSafeDownloadUrl(downloadUrl, baseUrl);
+  const imageResponse = await fetchImpl(safeUrl.toString(), {
+    redirect: 'error', // a redirect could otherwise walk off the allowed origin
+    signal: AbortSignal.timeout(15_000),
+  });
   if (!imageResponse.ok) throw new Error(`Photo download returned HTTP ${imageResponse.status}`);
   const contentLength = Number(imageResponse.headers.get('content-length'));
   if (Number.isFinite(contentLength) && contentLength > MAX_SOURCE_PHOTO_BYTES) {
     throw new Error('Photo download is too large');
   }
-  const sourceBytes = Buffer.from(await imageResponse.arrayBuffer());
-  if (sourceBytes.length === 0 || sourceBytes.length > MAX_SOURCE_PHOTO_BYTES) {
-    throw new Error('Photo download has an invalid size');
-  }
+  // content-length is advisory and absent on chunked responses, so enforce the
+  // cap while reading rather than buffering the whole body and checking after.
+  const sourceBytes = await readBounded(imageResponse, MAX_SOURCE_PHOTO_BYTES);
+  if (sourceBytes.length === 0) throw new Error('Photo download was empty');
   const pixels = await convertPhoto(sourceBytes);
   return {
     width: PHOTO_WIDTH,
@@ -622,13 +711,23 @@ export function createDashboardLoader(options = {}) {
   const cachePath = options.cachePath ?? DEFAULT_CACHE_PATH;
   const fetchImpl = options.fetchImpl ?? fetch;
   const photoLoader = options.photoLoader ?? loadPhoto;
+  const minForcedRefreshMs = options.minForcedRefreshMs ?? MIN_FORCED_REFRESH_MS;
   let memoryCache = null;
   let inFlight = null;
+  let lastForcedAt = 0;
+
+  // Loaded once and held. Re-reading per refresh would mean anything that could
+  // write to the image could change the SQL run against the warehouse.
+  let sqlPromise = null;
+  const loadSql = () => {
+    if (!sqlPromise) sqlPromise = readFile(queryPath, 'utf8');
+    return sqlPromise;
+  };
 
   async function fetchFresh() {
     const [{ baseUrl, token }, sql] = await Promise.all([
       readPdwConfig(pdwConfigPath),
-      readFile(queryPath, 'utf8'),
+      loadSql(),
     ]);
     const response = await fetchImpl(`${baseUrl}/api/tools/sql`, {
       method: 'POST',
@@ -644,7 +743,7 @@ export function createDashboardLoader(options = {}) {
       signal: AbortSignal.timeout(12_000),
     });
     if (!response.ok) throw new Error(`PDW API returned HTTP ${response.status}`);
-    const body = await response.json();
+    const body = JSON.parse((await readBounded(response, MAX_SQL_RESPONSE_BYTES)).toString('utf8'));
     const raw = body?.data?.rows?.[0]?.dashboard_json;
     if (!raw) throw new Error('PDW API returned no dashboard row');
     const parsed = JSON.parse(raw);
@@ -662,6 +761,10 @@ export function createDashboardLoader(options = {}) {
   }
 
   return async function loadDashboard({ force = false } = {}) {
+    if (force && Date.now() - lastForcedAt < minForcedRefreshMs && memoryCache) {
+      return memoryCache;
+    }
+    if (force) lastForcedAt = Date.now();
     const generated = memoryCache?.generatedAt
       ? new Date(memoryCache.generatedAt).valueOf()
       : 0;
@@ -715,7 +818,9 @@ export function createApp({ token, loadDashboard }) {
       const dashboard = await loadDashboard({ force: url.searchParams.get('refresh') === '1' });
       return jsonResponse(response, 200, dashboard);
     } catch (error) {
-      console.error(`[home-display] request failed: ${error.message}`);
+      // error.message can embed a fragment of the payload (JSON.parse quotes the
+      // offending input), so log the type only.
+      console.error(`[home-display] request failed: ${error.name}`);
       return jsonResponse(response, 503, { error: 'dashboard_unavailable' });
     }
   };

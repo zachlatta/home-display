@@ -19,9 +19,11 @@ WORKDIR /app
 # display its fallback.
 RUN mkdir -p /data && chown node:node /data
 
-COPY --from=deps --chown=node:node /app/node_modules ./node_modules
-COPY --chown=node:node package.json ./
-COPY --chown=node:node server ./server
+# Root-owned, runtime user has read-only access. The process must not be able to
+# rewrite its own source, its dependencies, or the SQL it runs.
+COPY --from=deps --chown=root:root /app/node_modules ./node_modules
+COPY --chown=root:root package.json ./
+COPY --chown=root:root server ./server
 
 USER node
 EXPOSE 8787

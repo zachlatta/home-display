@@ -237,6 +237,73 @@ test('an unusable photo falls through to the next candidate', async (t) => {
   assert.ok(value.photo.pixels.length > 0);
 });
 
+test('a photo download URL off the warehouse origin is refused', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'home-display-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const configPath = join(directory, 'pdw.json');
+  const queryPath = join(directory, 'query.sql');
+  await writeFile(configPath, JSON.stringify({ base_url: 'https://pdw.invalid', token: 'x'.repeat(40) }));
+  await writeFile(queryPath, 'select 1');
+
+  // A PDW that has been compromised, or is simply wrong, must not be able to
+  // steer the gateway at an internal address on the container network.
+  const hostile = [
+    'http://169.254.169.254/latest/meta-data/',
+    'http://127.0.0.1:8787/api/dashboard',
+    'https://attacker.example.com/x.jpg',
+  ];
+  const fetched = [];
+  for (const downloadUrl of hostile) {
+    const loader = createDashboardLoader({
+      pdwConfigPath: configPath,
+      queryPath,
+      cachePath: join(directory, `cache-${fetched.length}.json`),
+      minForcedRefreshMs: 0,
+      fetchImpl: async (url, init) => {
+        if (String(url).endsWith('/api/tools/sql')) {
+          return new Response(JSON.stringify({ data: { rows: [{ dashboard_json: JSON.stringify(raw) }] } }), { status: 200 });
+        }
+        if (String(url).endsWith('/api/tools/get_object')) {
+          return new Response(JSON.stringify({ data: { download_url: downloadUrl } }), { status: 200 });
+        }
+        fetched.push(String(url));
+        return new Response(Buffer.alloc(16), { status: 200 });
+      },
+    });
+    const value = await loader({ force: true });
+    assert.equal(value.photo, null, `expected no photo for ${downloadUrl}`);
+  }
+  assert.deepEqual(fetched, [], 'the gateway must not have fetched any disallowed URL');
+});
+
+test('a non-JPEG photo body is refused', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'home-display-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const configPath = join(directory, 'pdw.json');
+  const queryPath = join(directory, 'query.sql');
+  await writeFile(configPath, JSON.stringify({ base_url: 'https://pdw.invalid', token: 'x'.repeat(40) }));
+  await writeFile(queryPath, 'select 1');
+
+  const loader = createDashboardLoader({
+    pdwConfigPath: configPath,
+    queryPath,
+    cachePath: join(directory, 'cache.json'),
+    minForcedRefreshMs: 0,
+    fetchImpl: async (url) => {
+      if (String(url).endsWith('/api/tools/sql')) {
+        return new Response(JSON.stringify({ data: { rows: [{ dashboard_json: JSON.stringify(raw) }] } }), { status: 200 });
+      }
+      if (String(url).endsWith('/api/tools/get_object')) {
+        return new Response(JSON.stringify({ data: { download_url: 'https://pdw.invalid/object/1' } }), { status: 200 });
+      }
+      // An SVG would otherwise reach librsvg inside libvips.
+      return new Response(Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>'), { status: 200 });
+    },
+  });
+  const value = await loader({ force: true });
+  assert.equal(value.photo, null, 'a non-JPEG body must not reach the decoder');
+});
+
 test('loader serves the last good payload when PDW is temporarily unavailable', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'home-display-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
@@ -250,6 +317,7 @@ test('loader serves the last good payload when PDW is temporarily unavailable', 
     pdwConfigPath: configPath,
     queryPath,
     cachePath,
+    minForcedRefreshMs: 0, // exercise the failure path, not the amplification guard
     photoLoader: async () => ({
       width: 270,
       height: 250,
